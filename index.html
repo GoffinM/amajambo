@@ -41,6 +41,7 @@
   .topbar{padding:22px 20px 14px; display:flex; align-items:baseline; justify-content:space-between;}
   .settings-btn{background:var(--bg-card); border:1px solid rgba(255,255,255,0.08); color:var(--cream); font-size:18px; width:40px; height:40px; border-radius:12px; cursor:pointer; display:flex; align-items:center; justify-content:center; align-self:center;}
   .settings-btn-floating{position:fixed; top:calc(14px + env(safe-area-inset-top)); right:16px; z-index:30;}
+  .home-btn-floating{position:fixed; top:calc(14px + env(safe-area-inset-top)); left:16px; z-index:30;}
   .settings-overlay{position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:50; display:flex; align-items:flex-end; justify-content:center;}
   .settings-sheet{background:var(--bg); width:100%; max-width:480px; max-height:85vh; overflow-y:auto; border-radius:22px 22px 0 0; padding:20px 20px calc(20px + env(safe-area-inset-bottom)); animation:sheetUp .22s ease;}
   @keyframes sheetUp{from{transform:translateY(24px); opacity:0;} to{transform:translateY(0); opacity:1;}}
@@ -225,6 +226,7 @@ let state = {
   minimalMode: false,    // mode "juste des mots" : carte épurée
   settingsOpen: false,    // reglages (langue/sens/niveau/temps/longueur/minimal) dans une modale
   grammarInfoOpen: false, // encart pedagogique prefixe/infixe/radical
+  dictQuery: '', // recherche dictionnaire
   sessionLength: 12,     // taille de session (filtre libre)
   levelFilter: {1:true, 2:true, 3:true, 4:true}, // filtre libre, non bloquant
   tenseFilter: {present:true, futur:true, passe_recent:true}, // filtre libre, non bloquant
@@ -367,10 +369,16 @@ function render(){
   else if(state.screen === 'tac') app.appendChild(renderTac());
   else if(state.screen === 'accordsetup') app.appendChild(renderAccordSetup());
   else if(state.screen === 'accord') app.appendChild(renderAccord());
+  else if(state.screen === 'dictionary') app.appendChild(renderDictionary());
   if(['review','tac','accord'].includes(state.screen)){
     const floatBtn = el(`<button class="settings-btn settings-btn-floating">⚙️</button>`);
     floatBtn.addEventListener('click', ()=>{ state.settingsOpen=true; render(); });
     app.appendChild(floatBtn);
+  }
+  if(state.screen !== 'home'){
+    const homeBtn = el(`<button class="settings-btn home-btn-floating">⌂</button>`);
+    homeBtn.addEventListener('click', ()=>{ state.screen='home'; state.homeTheme=null; render(); });
+    app.appendChild(homeBtn);
   }
   app.appendChild(renderFooter());
   app.appendChild(renderNav());
@@ -387,11 +395,11 @@ function renderFooter(){
 
 function renderNav(){
   const wrap = el(`<div class="bottomnav">
-    <button class="nav-btn ${state.screen==='home'?'active':''}" data-go="home"><span class="ic">⌂</span>Accueil</button>
     <button class="nav-btn ${state.screen==='review'?'active':''}" data-go="review-start"><span class="ic">↻</span>Réviser</button>
     <button class="nav-btn ${state.screen==='compare'?'active':''}" data-go="compare"><span class="ic">⇄</span>Comparer</button>
     <button class="nav-btn ${(state.screen==='tac'||state.screen==='tacsetup')?'active':''}" data-go="tac-start"><span class="ic">⏱</span>Tac au tac</button>
     <button class="nav-btn ${(state.screen==='accord'||state.screen==='accordsetup')?'active':''}" data-go="accord-start"><span class="ic">✓</span>Accorder</button>
+    <button class="nav-btn ${state.screen==='dictionary'?'active':''}" data-go="dictionary"><span class="ic">🔍</span>Dictionnaire</button>
   </div>`);
   wrap.querySelectorAll('[data-go]').forEach(b=>b.addEventListener('click', ()=>handleNav(b.dataset.go)));
   return wrap;
@@ -403,6 +411,7 @@ function handleNav(go){
   if(go==='compare') state.screen='compare';
   if(go==='tac-start') { state.screen='tacsetup'; }
   if(go==='accord-start') { state.screen='accordsetup'; }
+  if(go==='dictionary') { state.screen='dictionary'; state.dictQuery=''; }
   render();
 }
 
@@ -711,6 +720,59 @@ function answersHtmlReverse(p){
 }
 // Un même pool ne peut mélanger sens direct/inverse : on filtre déjà par langAvailable(),
 // donc en sens inverse seules les phrases ayant la langue cible renseignée apparaissent.
+
+function renderDictionary(){
+  const wrap = el(`<div class="screen">
+    <div class="topbar"><div><h1 style="font-size:22px;">Dictionnaire</h1><div class="sub">Recherche libre — français, kirundi, kinyarwanda</div></div></div>
+    <div style="margin:4px 0 14px;">
+      <input type="text" id="dictInput" placeholder="Tape un mot..." value="${state.dictQuery.replace(/"/g,'&quot;')}"
+        style="width:100%; box-sizing:border-box; padding:14px 16px; border-radius:14px; border:1px solid rgba(255,255,255,0.1); background:var(--bg-card); color:var(--cream); font-size:15px; font-family:'IBM Plex Sans',sans-serif;">
+    </div>
+    <div id="dictResults"></div>
+  </div>`);
+
+  const input = wrap.querySelector('#dictInput');
+  const resultsHolder = wrap.querySelector('#dictResults');
+
+  function renderResults(){
+    const q = state.dictQuery.trim().toLowerCase();
+    resultsHolder.innerHTML = '';
+    if(!q){
+      resultsHolder.appendChild(el(`<p style="text-align:center; color:var(--cream-dim); font-size:13px; padding:30px 10px;">Commence à taper pour chercher dans les ${PHRASES.length} phrases de l'app.</p>`));
+      return;
+    }
+    const matches = PHRASES.filter(p=>{
+      return (p.fr && p.fr.toLowerCase().includes(q))
+        || (p.bi && p.bi.toLowerCase().includes(q))
+        || (p.rw && p.rw.toLowerCase().includes(q));
+    });
+    const wordBoundary = new RegExp('(^|[^a-zàâäéèêëïîôöùûüç])' + q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'), 'i');
+    matches.sort((a,b)=>{
+      const aScore = wordBoundary.test(a.fr||'') || wordBoundary.test(a.bi||'') || wordBoundary.test(a.rw||'') ? 0 : 1;
+      const bScore = wordBoundary.test(b.fr||'') || wordBoundary.test(b.bi||'') || wordBoundary.test(b.rw||'') ? 0 : 1;
+      return aScore - bScore;
+    });
+    const limited = matches.slice(0, 60);
+    if(limited.length === 0){
+      resultsHolder.appendChild(el(`<p style="text-align:center; color:var(--cream-dim); font-size:13px; padding:30px 10px;">Aucun résultat pour "${q}".</p>`));
+      return;
+    }
+    limited.forEach(p=>{
+      const lines = [];
+      if(p.bi) lines.push(`<div class="ans-row bi" style="margin-top:6px;"><div class="lbl">Kirundi</div><div class="word">${biDisplay(p)}</div>${flagNote(p,'bi')}</div>`);
+      if(p.rw) lines.push(`<div class="ans-row rw" style="margin-top:6px;"><div class="lbl">Kinyarwanda</div><div class="word">${rwDisplay(p)}</div>${flagNote(p,'rw')}</div>`);
+      resultsHolder.appendChild(el(`<div class="compare-card"><div class="fr">${p.fr}${levelBadge(p)}</div>${lines.join('')}</div>`));
+    });
+    if(matches.length > 60){
+      resultsHolder.appendChild(el(`<p style="text-align:center; color:var(--cream-dim); font-size:11.5px; padding:10px;">Affinez la recherche pour voir plus de résultats précis.</p>`));
+    }
+  }
+
+  input.addEventListener('input', (e)=>{ state.dictQuery = e.target.value; renderResults(); });
+  renderResults();
+  setTimeout(()=>input.focus(), 50);
+  return wrap;
+}
 
 function renderCompare(){
   // s'assure que compareCat appartient bien au theme actif
