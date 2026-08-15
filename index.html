@@ -101,6 +101,8 @@
   .ans-row{border-radius:14px; padding:14px 16px; text-align:left;}
   .ans-row.bi{background:var(--bi-bg);}
   .ans-row.rw{background:var(--rw-bg);}
+  .ans-row.frlang{background:rgba(215,167,60,0.14);}
+  .ans-row.frlang .lbl{color:var(--gold);}
   .ans-row .lbl{font-size:10px; font-weight:700; letter-spacing:1px; text-transform:uppercase; margin-bottom:4px;}
   .ans-row.bi .lbl{color:var(--bi);}
   .ans-row.rw .lbl{color:var(--rw);}
@@ -209,6 +211,9 @@ let state = {
   screen: "home",
   homeTheme: null,       // null = vue d'ensemble des thèmes, sinon clé du thème ouvert
   langMode: "both",     // 'both' | 'bi' | 'rw'
+  direction: "fwd",      // 'fwd' = FR -> langue cible | 'rev' = langue cible -> FR
+  minimalMode: false,    // mode "juste des mots" : carte épurée
+  sessionLength: 12,     // taille de session (filtre libre)
   levelFilter: {1:true, 2:true, 3:true, 4:true}, // filtre libre, non bloquant
   tenseFilter: {present:true, futur:true, passe_recent:true}, // filtre libre, non bloquant
   progress: {},         // id -> {box, due}
@@ -256,7 +261,12 @@ async function loadProgress(){
 }
 function setLangMode(mode){
   state.langMode = mode;
-  try{ localStorage.setItem('amakuru-lang-mode', mode); }catch(e){ console.error(e); }
+  if(mode==='both' && state.direction==='rev') state.langMode = 'bi'; // le sens inversé exige une langue precise
+  try{ localStorage.setItem('amakuru-lang-mode', state.langMode); }catch(e){ console.error(e); }
+}
+function setDirection(dir){
+  state.direction = dir;
+  if(dir==='rev' && state.langMode==='both') state.langMode = 'bi'; // force une langue precise en sens inverse
 }
 async function saveProgress(){
   try{ localStorage.setItem('amakuru-progress-all', JSON.stringify(state.progress)); }
@@ -392,15 +402,20 @@ function renderHome(){
       <div><h1>Amajambo</h1><div class="sub">Kirundi · Kinyarwanda</div></div>
     </div>
     <div class="cat-row" id="langRow"></div>
+    <div class="cat-row" id="dirRow"></div>
     <div class="filter-label">Niveau (filtre libre)</div>
     <div class="cat-row" id="lvlRow"></div>
     <div class="filter-label">Temps (filtre libre)</div>
     <div class="cat-row" id="tenseRow"></div>
+    <div class="filter-label">Longueur de session</div>
+    <div class="cat-row" id="lenRow"></div>
+    <div class="cat-row" id="minimalRow"></div>
     <div class="stat-row">
       <div class="stat"><span class="num">${due}</span><span class="lbl">à réviser</span></div>
       <div class="stat"><span class="num">${learned}</span><span class="lbl">en cours</span></div>
       <div class="stat"><span class="num">${total}</span><span class="lbl">phrases</span></div>
     </div>
+    <div id="randomLink" style="text-align:center; margin-top:2px;"><span class="crumb-link" style="font-size:12.5px; text-decoration:underline; color:var(--cream-dim); cursor:pointer;">🎲 Session aléatoire (peu importe ce qui est dû)</span></div>
     <div id="themeZone"></div>
   </div>`);
 
@@ -410,8 +425,31 @@ function renderHome(){
     chip.addEventListener('click', ()=>{ setLangMode(key); render(); });
     langRow.appendChild(chip);
   });
+
+  const dirRow = wrap.querySelector('#dirRow');
+  const dirTargetLabel = state.langMode==='rw' ? 'Kinyarwanda' : 'Kirundi';
+  [["fwd","Français → "+dirTargetLabel],["rev",dirTargetLabel+" → Français"]].forEach(([key,label])=>{
+    const chip = el(`<div class="chip ${state.direction===key?'active':''}">${label}</div>`);
+    chip.addEventListener('click', ()=>{ setDirection(key); render(); });
+    dirRow.appendChild(chip);
+  });
+
   renderLevelChips(wrap.querySelector('#lvlRow'));
   renderTenseChips(wrap.querySelector('#tenseRow'));
+
+  const lenRow = wrap.querySelector('#lenRow');
+  [6,12,20,30].forEach(n=>{
+    const chip = el(`<div class="chip ${state.sessionLength===n?'active':''}">${n} cartes</div>`);
+    chip.addEventListener('click', ()=>{ state.sessionLength = n; render(); });
+    lenRow.appendChild(chip);
+  });
+
+  const minimalRow = wrap.querySelector('#minimalRow');
+  const minimalChip = el(`<div class="chip ${state.minimalMode?'active':''}">📝 Mode "juste des mots"</div>`);
+  minimalChip.addEventListener('click', ()=>{ state.minimalMode = !state.minimalMode; render(); });
+  minimalRow.appendChild(minimalChip);
+
+  wrap.querySelector('#randomLink').addEventListener('click', ()=>{ startRandomSession(); render(); });
 
   const zone = wrap.querySelector('#themeZone');
 
@@ -494,6 +532,23 @@ function answersHtml(p){
     </div>`;
 }
 
+// --- Sens inversé (langue cible -> français) ---
+function promptText(p){
+  if(state.direction!=='rev') return p.fr;
+  return state.langMode==='rw' ? rwDisplay(p) : biDisplay(p);
+}
+function promptFlagNote(p){
+  if(state.direction!=='rev') return '';
+  return flagNote(p, state.langMode==='rw' ? 'rw' : 'bi');
+}
+function answersHtmlReverse(p){
+  return `<div class="flash-answers">
+      <div class="ans-row frlang"><div class="lbl">Français</div><div class="word">${p.fr}</div></div>
+    </div>`;
+}
+// Un même pool ne peut mélanger sens direct/inverse : on filtre déjà par langAvailable(),
+// donc en sens inverse seules les phrases ayant la langue cible renseignée apparaissent.
+
 function renderCompare(){
   // s'assure que compareCat appartient bien au theme actif
   if(!THEMES[state.compareTheme].cats.includes(state.compareCat) || !totalCountForCat(state.compareCat)){
@@ -552,7 +607,7 @@ function renderCompare(){
   return wrap;
 }
 
-const SESSION_CAP = 12; // taille max d'une session pour ne pas trop l'allonger
+// (taille de session désormais pilotée par state.sessionLength, filtre libre sur l'accueil)
 
 function shuffle(arr){ return arr.slice().sort(()=>Math.random()-0.5); }
 
@@ -590,10 +645,19 @@ function buildSession(pool, cap){
 function startReview(){
   let ids = dueIds();
   if(ids.length===0) ids = phrasesForMode().map(p=>p.id);
-  state.session = buildSession(ids, SESSION_CAP);
+  state.session = buildSession(ids, state.sessionLength);
   state.sIndex = 0;
   state.revealed = false;
   state.reviewCat = null; // révision globale, pas de contexte thème/sous-cat précis
+  state.screen = 'review';
+}
+
+function startRandomSession(){
+  const ids = phrasesForMode().map(p=>p.id);
+  state.session = buildSession(ids, state.sessionLength);
+  state.sIndex = 0;
+  state.revealed = false;
+  state.reviewCat = null;
   state.screen = 'review';
 }
 
@@ -601,7 +665,7 @@ function startReviewCat(cat){
   const now = todayTs();
   let ids = PHRASES.filter(p=>p.cat===cat && langAvailable(p) && levelOk(p) && tenseOk(p) && getProg(p.id).due<=now).map(p=>p.id);
   if(ids.length===0) ids = PHRASES.filter(p=>p.cat===cat && langAvailable(p) && levelOk(p) && tenseOk(p)).map(p=>p.id);
-  state.session = buildSession(ids, SESSION_CAP);
+  state.session = buildSession(ids, state.sessionLength);
   state.sIndex = 0;
   state.revealed = false;
   state.reviewCat = cat;
@@ -632,20 +696,21 @@ function renderReview(){
   }
   const p = PHRASES.find(x=>x.id===state.session[state.sIndex]);
   const pct = Math.round((state.sIndex/state.session.length)*100);
+  const minimal = state.minimalMode;
   const wrap = el(`<div class="screen">
     <div id="crumbHolder"></div>
     <div class="flash-wrap">
       <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
       <div class="flash-card">
-        <div class="cat-eyebrow">${CATS[p.cat]}${levelBadge(p)}</div>
-        <div class="flash-fr">${p.fr}</div>
+        ${minimal ? '' : `<div class="cat-eyebrow">${CATS[p.cat]}${levelBadge(p)}</div>`}
+        <div class="flash-fr" style="${minimal?'font-size:26px;':''}">${promptText(p)}${promptFlagNote(p)}</div>
         <div id="answersHolder"></div>
         ${!state.revealed ? '<div class="tap-hint">Touchez pour révéler</div>' : ''}
       </div>
       <div id="rateHolder"></div>
     </div>
   </div>`);
-  if(state.reviewCat){
+  if(state.reviewCat && !minimal){
     const theme = THEMES[themeOfCat(state.reviewCat)];
     const crumb = renderBreadcrumb([
       {label:"Accueil", onClick:()=>{ state.screen='home'; state.homeTheme=null; render(); }},
@@ -661,7 +726,8 @@ function renderReview(){
     card.style.cursor='pointer';
     card.addEventListener('click', ()=>{ state.revealed=true; render(); });
   } else {
-    wrap.querySelector('#answersHolder').innerHTML = answersHtml(p) + asteriskLegend([p]);
+    const ansHtml = state.direction==='rev' ? answersHtmlReverse(p) : answersHtml(p);
+    wrap.querySelector('#answersHolder').innerHTML = ansHtml + asteriskLegend([p]);
     const rateEl = el(`<div class="rate-row">
       <button class="rate-btn rate-hard" data-lvl="0">Difficile</button>
       <button class="rate-btn rate-ok" data-lvl="1">Correct</button>
@@ -686,7 +752,7 @@ function startTac(){
     const cats = THEMES[state.tacTheme].cats;
     pool = pool.filter(p=>cats.includes(p.cat));
   }
-  let ids = pool.map(p=>p.id).sort(()=>Math.random()-0.5).slice(0,10);
+  let ids = pool.map(p=>p.id).sort(()=>Math.random()-0.5).slice(0,state.sessionLength);
   state.session = ids;
   state.sIndex = 0;
   state.revealed = false;
@@ -733,12 +799,13 @@ function renderTac(){
   }
   const p = PHRASES.find(x=>x.id===state.session[state.sIndex]);
   const pct = Math.round((state.sIndex/state.session.length)*100);
+  const minimal = state.minimalMode;
   const wrap = el(`<div class="screen">
     <div class="flash-wrap">
       <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
       <div class="flash-card">
-        <div class="cat-eyebrow">${CATS[p.cat]}${levelBadge(p)}</div>
-        <div class="flash-fr">${p.fr}</div>
+        ${minimal ? '' : `<div class="cat-eyebrow">${CATS[p.cat]}${levelBadge(p)}</div>`}
+        <div class="flash-fr" style="${minimal?'font-size:26px;':''}">${promptText(p)}${promptFlagNote(p)}</div>
         <div id="tacBody"></div>
       </div>
       <div id="rateHolder"></div>
@@ -750,7 +817,7 @@ function renderTac(){
     if(state.timerId) clearTimeout(state.timerId);
     state.timerId = setTimeout(()=>{ state.revealed = true; render(); }, 3000);
   } else {
-    body.innerHTML = answersHtml(p);
+    body.innerHTML = state.direction==='rev' ? answersHtmlReverse(p) : answersHtml(p);
     const rateEl = el(`<div class="rate-row">
       <button class="rate-btn rate-hard" data-lvl="0">J'ai bloqué</button>
       <button class="rate-btn rate-easy" data-lvl="2">Réagi vite</button>
