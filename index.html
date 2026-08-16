@@ -227,6 +227,15 @@ let state = {
   settingsOpen: false,    // reglages (langue/sens/niveau/temps/longueur/minimal) dans une modale
   grammarInfoOpen: false, // encart pedagogique prefixe/infixe/radical
   dictQuery: '', // recherche dictionnaire
+  analytics: {
+    screenTime: {home:0, review:0, compare:0, tac:0, accord:0, dictionary:0},
+    sessionsLaunched: {review:0, random:0, tac:0, accord:0},
+    ratings: {hard:0, ok:0, easy:0},
+    dictMisses: [],
+    firstUse: null,
+  },
+  analyticsLastScreen: null,
+  analyticsLastTs: null,
   sessionLength: 12,     // taille de session (filtre libre)
   levelFilter: {1:true, 2:true, 3:true, 4:true}, // filtre libre, non bloquant
   tenseFilter: {present:true, futur:true, passe_recent:true}, // filtre libre, non bloquant
@@ -287,6 +296,53 @@ async function saveProgress(){
   try{ localStorage.setItem('amakuru-progress-all', JSON.stringify(state.progress)); }
   catch(e){ console.error('save failed', e); }
 }
+
+// --- Analytics locales (jamais envoyees automatiquement, export manuel uniquement) ---
+async function loadAnalytics(){
+  try{
+    const raw = localStorage.getItem('amakuru-analytics');
+    if(raw){
+      const parsed = JSON.parse(raw);
+      state.analytics = Object.assign({}, state.analytics, parsed);
+    }
+  }catch(e){ /* garde les valeurs par defaut */ }
+  if(!state.analytics.firstUse) state.analytics.firstUse = Date.now();
+}
+function saveAnalytics(){
+  try{ localStorage.setItem('amakuru-analytics', JSON.stringify(state.analytics)); }
+  catch(e){ console.error('analytics save failed', e); }
+}
+// Suit le temps ecoule sur l'ecran precedent a chaque changement d'ecran.
+// Appele au debut de render() : compare l'ecran actuel au dernier connu.
+function trackScreenTime(){
+  const now = Date.now();
+  if(state.analyticsLastScreen && state.analyticsLastTs){
+    const elapsedSec = Math.min(600, (now - state.analyticsLastTs) / 1000); // plafond 10min anti-onglet-oublie-ouvert
+    const key = state.analyticsLastScreen;
+    if(state.analytics.screenTime[key] !== undefined && elapsedSec > 0.5){
+      state.analytics.screenTime[key] += elapsedSec;
+      saveAnalytics();
+    }
+  }
+  // regroupe les ecrans de setup avec leur ecran principal pour un suivi plus lisible
+  const group = {tacsetup:'tac', accordsetup:'accord'}[state.screen] || state.screen;
+  state.analyticsLastScreen = group;
+  state.analyticsLastTs = now;
+}
+function logSessionLaunch(type){
+  if(state.analytics.sessionsLaunched[type] !== undefined) state.analytics.sessionsLaunched[type]++;
+  saveAnalytics();
+}
+function logRating(level){
+  const key = level===0 ? 'hard' : (level===2 ? 'easy' : 'ok');
+  state.analytics.ratings[key]++;
+  saveAnalytics();
+}
+function logDictMiss(query){
+  if(!query || query.length<2) return;
+  if(!state.analytics.dictMisses.includes(query)) state.analytics.dictMisses.push(query);
+  saveAnalytics();
+}
 function getProg(id){
   if(!state.progress[id]) state.progress[id] = {box:1, due:0};
   return state.progress[id];
@@ -307,6 +363,7 @@ function totalCountForCat(cat){
 }
 function rate(id, level){
   // level: 0 hard (reset), 1 ok (+1 box), 2 easy (+2 box)
+  logRating(level);
   const pr = getProg(id);
   if(level===0) pr.box = 1;
   else pr.box = Math.min(6, pr.box + (level===2?2:1));
@@ -360,6 +417,7 @@ function asteriskLegend(list){
 }
 
 function render(){
+  trackScreenTime();
   const app = document.getElementById('app');
   app.innerHTML = '';
   if(state.screen === 'home') app.appendChild(renderHome());
@@ -422,6 +480,53 @@ function themeStats(themeKey){
   return {due, total};
 }
 
+function buildAnalyticsSummary(){
+  const a = state.analytics;
+  const fmtMin = (sec) => Math.round(sec/60);
+  const since = a.firstUse ? new Date(a.firstUse).toLocaleDateString('fr-FR') : '?';
+  const lines = [];
+  lines.push(`Statistiques Amajambo — depuis le ${since}`);
+  lines.push('');
+  lines.push('Temps par écran (minutes) :');
+  lines.push(`  Accueil : ${fmtMin(a.screenTime.home)}`);
+  lines.push(`  Réviser : ${fmtMin(a.screenTime.review)}`);
+  lines.push(`  Comparer : ${fmtMin(a.screenTime.compare)}`);
+  lines.push(`  Tac au tac : ${fmtMin(a.screenTime.tac)}`);
+  lines.push(`  Accorder : ${fmtMin(a.screenTime.accord)}`);
+  lines.push(`  Dictionnaire : ${fmtMin(a.screenTime.dictionary)}`);
+  lines.push('');
+  lines.push('Sessions lancées :');
+  lines.push(`  Réviser : ${a.sessionsLaunched.review}`);
+  lines.push(`  Session aléatoire : ${a.sessionsLaunched.random}`);
+  lines.push(`  Tac au tac : ${a.sessionsLaunched.tac}`);
+  lines.push(`  Accorder : ${a.sessionsLaunched.accord}`);
+  lines.push('');
+  const totalRatings = a.ratings.hard + a.ratings.ok + a.ratings.easy;
+  lines.push(`Évaluations (${totalRatings} au total) :`);
+  lines.push(`  Difficile : ${a.ratings.hard}`);
+  lines.push(`  Correct : ${a.ratings.ok}`);
+  lines.push(`  Facile : ${a.ratings.easy}`);
+  lines.push('');
+  lines.push(`Recherches dictionnaire sans résultat (${a.dictMisses.length}) :`);
+  if(a.dictMisses.length===0) lines.push('  (aucune)');
+  else a.dictMisses.forEach(q=>lines.push(`  - ${q}`));
+  return lines.join('\n');
+}
+
+async function exportAnalytics(){
+  const text = buildAnalyticsSummary();
+  if(navigator.share){
+    try{ await navigator.share({ title: 'Statistiques Amajambo', text }); return; }
+    catch(e){ /* l'utilisateur a peut-être annulé, on retombe sur la copie */ }
+  }
+  try{
+    await navigator.clipboard.writeText(text);
+    alert('Statistiques copiées dans le presse-papier — colle-les où tu veux les envoyer.');
+  }catch(e){
+    alert(text); // dernier recours si rien d'autre ne marche
+  }
+}
+
 function renderSettingsModal(){
   const overlay = el(`<div class="settings-overlay">
     <div class="settings-sheet">
@@ -442,11 +547,15 @@ function renderSettingsModal(){
       <div class="cat-row" id="tenseRow"></div>
       <div class="filter-label">Longueur de session</div>
       <div class="cat-row" id="lenRow"></div>
+      <div class="filter-label" style="margin-top:18px;">Statistiques d'usage</div>
+      <p style="font-size:11.5px; color:var(--cream-dim); line-height:1.5; margin:0 0 10px;">Ces statistiques restent uniquement sur ton téléphone. Rien n'est envoyé automatiquement — seulement si tu appuies sur "Exporter" ci-dessous, pour aider à améliorer l'app.</p>
+      <button class="primary-btn" id="exportAnalytics" style="width:100%;">📊 Exporter mes statistiques</button>
     </div>
   </div>`);
 
   overlay.addEventListener('click', (e)=>{ if(e.target===overlay){ state.settingsOpen=false; render(); } });
   overlay.querySelector('#closeSettings').addEventListener('click', ()=>{ state.settingsOpen=false; render(); });
+  overlay.querySelector('#exportAnalytics').addEventListener('click', exportAnalytics);
 
   const langRow = overlay.querySelector('#langRow');
   [["both","Les deux"],["bi","Kirundi"],["rw","Kinyarwanda"]].forEach(([key,label])=>{
@@ -754,6 +863,8 @@ function renderDictionary(){
     });
     const limited = matches.slice(0, 60);
     if(limited.length === 0){
+      clearTimeout(window.__dictMissTimer);
+      window.__dictMissTimer = setTimeout(()=>{ logDictMiss(q); }, 900); // n'enregistre que si l'utilisateur arrete de taper
       resultsHolder.appendChild(el(`<p style="text-align:center; color:var(--cream-dim); font-size:13px; padding:30px 10px;">Aucun résultat pour "${q}".</p>`));
       return;
     }
@@ -868,6 +979,7 @@ function buildSession(pool, cap){
 }
 
 function startReview(){
+  logSessionLaunch('review');
   let ids = dueIds();
   if(ids.length===0) ids = phrasesForMode().map(p=>p.id);
   state.session = buildSession(ids, state.sessionLength);
@@ -878,6 +990,7 @@ function startReview(){
 }
 
 function startRandomSession(){
+  logSessionLaunch('random');
   const ids = phrasesForMode().map(p=>p.id);
   state.session = buildSession(ids, state.sessionLength);
   state.sIndex = 0;
@@ -887,6 +1000,7 @@ function startRandomSession(){
 }
 
 function startReviewCat(cat){
+  logSessionLaunch('review');
   const now = todayTs();
   let ids = PHRASES.filter(p=>p.cat===cat && langAvailable(p) && levelOk(p) && tenseOk(p) && getProg(p.id).due<=now).map(p=>p.id);
   if(ids.length===0) ids = PHRASES.filter(p=>p.cat===cat && langAvailable(p) && levelOk(p) && tenseOk(p)).map(p=>p.id);
@@ -979,6 +1093,7 @@ function startTac(){
     pool = pool.filter(p=>cats.includes(p.cat));
   }
   let ids = pool.map(p=>p.id).sort(()=>Math.random()-0.5).slice(0,state.sessionLength);
+  logSessionLaunch('tac');
   state.session = ids;
   state.sIndex = 0;
   state.revealed = false;
@@ -1121,6 +1236,7 @@ const ACCORD_THEME_LABELS = {bases:"Bases & socialiser", famille:"Famille & vie 
 
 function startAccord(themeKey){
   state.accordTheme = themeKey;
+  logSessionLaunch('accord');
   const pool = ACCORD_EXERCISES.map((_,i)=>i).filter(i=>ACCORD_EXERCISES[i].theme===themeKey);
   state.accordSession = pool.sort(()=>Math.random()-0.5);
   state.accordIndex = 0;
@@ -1210,6 +1326,7 @@ function renderAccord(){
 (async function init(){
   try{
     await loadProgress();
+    await loadAnalytics();
     render();
   }catch(e){
     console.error('Amajambo init error:', e);
